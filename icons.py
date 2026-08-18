@@ -9,13 +9,11 @@ def ensure_icons(static_dir: Path) -> None:
     icons = static_dir / "icons"
     icons.mkdir(parents=True, exist_ok=True)
     for size in (192, 512):
-        path = icons / f"icon-{size}.png"
-        if not path.exists():
-            _write_play_icon(path, size)
+        _write_play_icon(icons / f"icon-{size}.png", size)
 
 
 def _write_play_icon(path: Path, size: int) -> None:
-    bg = (240, 162, 2, 255)
+    bg = (255, 106, 0, 255)
     fg = (20, 16, 12, 255)
     pixels = bytearray()
     cx = cy = size / 2

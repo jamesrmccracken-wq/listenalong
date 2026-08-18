@@ -1,4 +1,4 @@
-const CACHE = "listenalong-v3";
+const CACHE = "listenalong-v4";
 const APP_SHELL = ["/", "/manifest.json", "/static/css/app.css", "/static/js/app.js", "/static/icons/icon-192.png"];
 
 self.addEventListener("install", (event) => {
@@ -18,17 +18,14 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
   if (event.request.method !== "GET") return;
-
   if (url.pathname.includes("/audio")) {
     event.respondWith(cacheFirst(event.request));
     return;
   }
-
   if (url.pathname.startsWith("/api/")) {
     event.respondWith(networkFirst(event.request));
     return;
   }
-
   event.respondWith(cacheFirst(event.request));
 });
 

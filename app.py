@@ -38,7 +38,7 @@ While the audio plays, the current words stay highlighted so you can dual-code: 
 
 Open it from any network — home, work, or mobile data. Add it to your phone’s home screen. Generated audio is a real recording, so it keeps playing when the screen locks on the commute.
 
-Playback speed, fifteen-second skips, bookmarks, chapter jumping, offline download, and a sleep timer are in the player. Your place in each title is saved and follows you across devices.
+Playback speed, thirty-second skips, bookmarks, chapter jumping, offline download, sleep timer, and Immersion Reading are in the player. Your place in each title is saved and follows you across devices.
 
 This welcome chapter was generated the first time the app started. Import your own material whenever you are ready.
 """.strip()
@@ -141,7 +141,9 @@ class LoginIn(BaseModel):
 
 
 class TitleIn(BaseModel):
-    title: str
+    title: str | None = None
+    author: str | None = None
+    finished: bool | None = None
 
 
 class BookmarkIn(BaseModel):
@@ -197,6 +199,11 @@ async def logout() -> JSONResponse:
 @app.get("/api/voices")
 async def voices() -> list[dict[str, str]]:
     return voice_cache
+
+
+@app.get("/api/home")
+async def home() -> dict:
+    return db.home()
 
 
 @app.get("/api/continue")
@@ -288,17 +295,27 @@ async def save_progress(book_id: int, payload: ProgressIn) -> dict:
         "UPDATE books SET progress_chapter = ?, progress_time = ?, last_listened_at = datetime('now') WHERE id = ?",
         (payload.chapter_idx, payload.time, book_id),
     )
+    book = db.book_with_chapters(book_id)
+    if book and book["duration"] and book["elapsed"] >= book["duration"] * 0.98:
+        db.execute("UPDATE books SET finished_at = datetime('now') WHERE id = ? AND finished_at IS NULL", (book_id,))
     return {"ok": True}
 
 
 @app.patch("/api/books/{book_id}")
-async def rename_book(book_id: int, payload: TitleIn) -> dict:
-    title = payload.title.strip()
-    if not title:
-        raise HTTPException(400, "Title is required")
+async def update_book(book_id: int, payload: TitleIn) -> dict:
     if not db.query("SELECT id FROM books WHERE id = ?", (book_id,)):
         raise HTTPException(404, "Book not found")
-    db.execute("UPDATE books SET title = ? WHERE id = ?", (title, book_id))
+    if payload.title is not None:
+        title = payload.title.strip()
+        if not title:
+            raise HTTPException(400, "Title is required")
+        db.execute("UPDATE books SET title = ? WHERE id = ?", (title, book_id))
+    if payload.author is not None:
+        db.execute("UPDATE books SET author = ? WHERE id = ?", (payload.author.strip(), book_id))
+    if payload.finished is True:
+        db.execute("UPDATE books SET finished_at = datetime('now') WHERE id = ?", (book_id,))
+    if payload.finished is False:
+        db.execute("UPDATE books SET finished_at = NULL WHERE id = ?", (book_id,))
     book = db.book_with_chapters(book_id)
     assert book
     return book
@@ -341,6 +358,7 @@ async def delete_book(book_id: int) -> dict:
 async def create_book(
     files: list[UploadFile] = File(...),
     title: str = Form(""),
+    author: str = Form(""),
     voice: str = Form(DEFAULT_VOICE),
 ) -> dict:
     if not files:
@@ -384,7 +402,7 @@ async def create_book(
     book_title = title.strip() or inferred
     book_id = db.execute(
         "INSERT INTO books (title, author, source_name, voice, status, cover_hue) VALUES (?, ?, ?, ?, ?, ?)",
-        (book_title, "", "; ".join(source_names[:8]), voice or DEFAULT_VOICE, "processing", hue_for(book_title)),
+        (book_title, author.strip(), "; ".join(source_names[:8]), voice or DEFAULT_VOICE, "processing", hue_for(book_title)),
     )
     for idx, chapter in enumerate(chapters):
         db.execute(

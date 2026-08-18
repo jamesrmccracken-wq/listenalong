@@ -56,6 +56,7 @@ def connect(db_path: Path) -> None:
         """
     )
     _ensure_column("books", "last_listened_at", "TEXT")
+    _ensure_column("books", "finished_at", "TEXT")
     _conn.commit()
 
 
@@ -93,10 +94,15 @@ def _progress_stats(book: dict[str, Any], chapters: list[dict[str, Any]]) -> dic
             elapsed += float(chapter.get("duration") or 0)
     book["duration"] = total
     book["elapsed"] = elapsed
+    book["remaining"] = max(0.0, total - elapsed)
     book["progress_pct"] = 0 if not total else min(100, round(100 * elapsed / total, 1))
     ready = sum(1 for ch in chapters if ch["status"] == "ready")
     book["ready_chapters"] = ready
     book["chapter_count"] = len(chapters)
+    book["finished"] = bool(book.get("finished_at")) or (total > 0 and elapsed >= total * 0.98)
+    book["narrator"] = _narrator_name(book.get("voice") or "")
+    if not book.get("author"):
+        book["author"] = "Unknown"
     return book
 
 
@@ -134,6 +140,26 @@ def list_books(search: str = "") -> list[dict[str, Any]]:
         )
         _progress_stats(book, chapters)
     return books
+
+
+def _narrator_name(voice: str) -> str:
+    stem = voice.split("-")[-1] if voice else "Narrator"
+    stem = stem.replace("Neural", "").replace("Multilingual", "")
+    return stem or "Narrator"
+
+
+def home() -> dict[str, Any]:
+    books = list_books()
+    listening = [b for b in books if b["elapsed"] > 8 and not b["finished"]]
+    recent = sorted(books, key=lambda b: b.get("created_at") or "", reverse=True)
+    finished = [b for b in books if b["finished"]]
+    return {
+        "continue": continue_book(),
+        "listening": listening[:12],
+        "recent": recent[:16],
+        "finished": finished[:12],
+        "library_count": len(books),
+    }
 
 
 def continue_book() -> dict[str, Any] | None:
