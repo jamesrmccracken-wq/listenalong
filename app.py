@@ -150,12 +150,12 @@ class BookmarkIn(BaseModel):
     note: str = ""
 
 
-@app.get("/healthz")
+@app.api_route("/healthz", methods=["GET", "HEAD"])
 async def healthz() -> dict:
     return {"ok": True}
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def index() -> FileResponse:
     return FileResponse(STATIC / "index.html")
 
