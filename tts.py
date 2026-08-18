@@ -140,6 +140,15 @@ async def synthesize_chapter_retry(text: str, voice: str, mp3_path: Path) -> tup
     raise last_error
 
 
+PREVIEW_LINE = "This is how I will sound when I read your book. Settle in, and follow along."
+
+
+async def preview_voice(voice: str, mp3_path: Path) -> None:
+    if mp3_path.exists() and mp3_path.stat().st_size > 1000:
+        return
+    await synthesize_chapter_retry(PREVIEW_LINE, voice, mp3_path)
+
+
 async def list_english_voices() -> list[dict[str, str]]:
     voices = await edge_tts.list_voices()
     english = [

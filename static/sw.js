@@ -1,4 +1,4 @@
-const CACHE = "listenalong-v4";
+const CACHE = "listenalong-v5";
 const APP_SHELL = ["/", "/manifest.json", "/static/css/app.css", "/static/js/app.js", "/static/icons/icon-192.png"];
 
 self.addEventListener("install", (event) => {

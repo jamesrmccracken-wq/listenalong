@@ -32,7 +32,21 @@ const state = {
   poll: null,
   stream: null,
   installEvent: null,
+  stats: { today_seconds: 0, total_seconds: 0, finished: 0, titles: 0, streak: 0 },
+  boost: Number(localStorage.getItem("la-boost") || 1),
+  layout: localStorage.getItem("la-layout") || "grid",
+  queue: JSON.parse(localStorage.getItem("la-queue") || "[]"),
+  downloaded: JSON.parse(localStorage.getItem("la-dl") || "[]"),
+  findQuery: "",
+  searchHits: { books: [], passages: [] },
+  keepAwake: localStorage.getItem("la-wake") !== "0",
+  haptics: localStorage.getItem("la-haptics") !== "0",
 };
+let lastTick = Date.now();
+let audioCtx = null;
+let gainNode = null;
+let mediaSource = null;
+let wakeLock = null;
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
 window.addEventListener("beforeinstallprompt", (event) => {
@@ -105,6 +119,43 @@ function greeting() {
 }
 
 function toast(message) {
+  state.toast = message;
+  render();
+  setTimeout(() => {
+    if (state.toast === message) {
+      state.toast = "";
+      render();
+    }
+  }, 2200);
+}
+
+function buzz() {
+  if (state.haptics && navigator.vibrate) navigator.vibrate(12);
+}
+
+function downloaded(id) {
+  return state.downloaded.includes(id);
+}
+
+function saveQueue() {
+  localStorage.setItem("la-queue", JSON.stringify(state.queue));
+}
+
+function ensureGraph() {
+  if (mediaSource || !window.AudioContext) return;
+  audioCtx = new AudioContext();
+  mediaSource = audioCtx.createMediaElementSource(audio);
+  gainNode = audioCtx.createGain();
+  gainNode.gain.value = state.boost;
+  mediaSource.connect(gainNode).connect(audioCtx.destination);
+}
+
+async function setWake(on) {
+  try {
+    if (on && state.keepAwake && "wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen");
+    else if (wakeLock) { await wakeLock.release(); wakeLock = null; }
+  } catch { /* ignore */ }
+}
   state.toast = message;
   render();
   setTimeout(() => {
@@ -200,9 +251,14 @@ async function playChapter(book, chapter, time = 0, intoPlayer = true) {
   const startAt = Math.max(0, time - (time > 2 ? 2 : 0));
   const go = async () => {
     try { audio.currentTime = startAt; } catch { /* ignore */ }
+    ensureGraph();
+    if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+    if (gainNode) gainNode.gain.value = state.boost;
     setupMediaSession();
     prefetchNext();
     cacheAudio(audio.src);
+    buzz();
+    setWake(true);
     if (intoPlayer) state.view = "player";
     render();
   };
@@ -247,10 +303,17 @@ function setupMediaSession() {
 
 function saveProgress() {
   if (!state.book || !state.chapter) return;
+  const now = Date.now();
+  const listened = audio.paused ? 0 : Math.min(15, (now - lastTick) / 1000) * state.speed;
+  lastTick = now;
   fetch(`/api/books/${state.book.id}/progress`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chapter_idx: Math.max(0, currentChapterIndex()), time: audio.currentTime || 0 }),
+    body: JSON.stringify({
+      chapter_idx: Math.max(0, currentChapterIndex()),
+      time: audio.currentTime || 0,
+      listened,
+    }),
   }).catch(() => {});
 }
 
@@ -262,12 +325,16 @@ function prefetchNext() {
 
 function cacheAudio(url) {
   if (!("caches" in window)) return;
-  caches.open("listenalong-v4").then((cache) => cache.add(url).catch(() => {}));
+  caches.open("listenalong-v5").then((cache) => cache.add(url).catch(() => {}));
 }
 
 async function downloadBook(book) {
   const ready = (book.chapters || []).filter((ch) => ch.status === "ready");
   for (const chapter of ready) cacheAudio(`/api/books/${book.id}/chapters/${chapter.id}/audio`);
+  if (!downloaded(book.id)) {
+    state.downloaded.push(book.id);
+    localStorage.setItem("la-dl", JSON.stringify(state.downloaded));
+  }
   toast(`Downloaded ${ready.length} chapters`);
 }
 
@@ -366,9 +433,9 @@ async function bookmarkHere() {
 }
 
 function coverEl(book, extraClass = "") {
-  return h("div", { class: `cover ${extraClass}`, style: coverStyle(book) }, [
-    h("b", {}, book.title),
-    h("small", {}, book.narrator ? `Narrated by ${book.narrator}` : formatLength(book.duration)),
+  return h("div", { class: `cover ${extraClass}` }, [
+    h("img", { src: `/api/books/${book.id}/cover`, alt: book.title, loading: "lazy" }),
+    downloaded(book.id) ? h("span", { class: "dl-badge" }, "Saved") : null,
   ]);
 }
 
@@ -400,13 +467,7 @@ function nav() {
     item("home", "Home", '<path d="M4 10.5 12 4l8 6.5V20a1 1 0 0 1-1 1h-5v-7H10v7H5a1 1 0 0 1-1-1z"/>'),
     item("library", "Library", '<rect x="4" y="5" width="6" height="14" rx="1"/><rect x="14" y="5" width="6" height="14" rx="1"/>'),
     item("add", "Add", '<circle cx="12" cy="12" r="8"/><path d="M12 8v8M8 12h8"/>'),
-    h("button", {
-      class: state.view === "player" ? "on" : "",
-      onclick: () => {
-        if (state.chapter) { state.view = "player"; render(); }
-        else toast("Nothing is playing");
-      },
-    }, [svg('<circle cx="12" cy="12" r="9"/><path d="M10 8l7 4-7 4z"/>'), "Playing"]),
+    item("you", "You", '<circle cx="12" cy="8" r="3"/><path d="M5 19c1.5-3 4-5 7-5s5.5 2 7 5"/>'),
   ]);
 }
 
@@ -424,8 +485,15 @@ function mini() {
 }
 
 function togglePlay() {
-  if (audio.paused) audio.play();
-  else audio.pause();
+  ensureGraph();
+  if (audio.paused) {
+    if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+    audio.play();
+    setWake(true);
+  } else {
+    audio.pause();
+    setWake(false);
+  }
   syncPlayButtons();
 }
 
@@ -433,7 +501,17 @@ function playerView() {
   if (!state.book || !state.chapter) return homeView();
   const idx = currentChapterIndex();
   const remaining = remainingNow();
-  return h("div", { class: "player" }, [
+  return h("div", {
+    class: "player",
+    ontouchstart: (e) => { state._swipeY = e.changedTouches[0].clientY; },
+    ontouchend: (e) => {
+      if ((e.changedTouches[0].clientY - (state._swipeY || 0)) > 90) {
+        state.view = "title";
+        state.tab = "library";
+        render();
+      }
+    },
+  }, [
     h("div", { class: "bar" }, [
       h("button", { class: "icon-btn", onclick: () => { state.view = "title"; state.tab = "library"; render(); } }, svg('<path d="M6 9l6 6 6-6"/>')),
       h("span", { class: "muted" }, "Now playing"),
@@ -468,6 +546,7 @@ function playerView() {
       h("button", { onclick: () => { state.sheet = "sleep"; render(); } }, [svg('<path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="8"/>'), "Sleep"]),
       h("button", { onclick: bookmarkHere }, [svg('<path d="M7 4h10v16l-5-3-5 3z"/>'), "Bookmark"]),
       h("button", { onclick: () => { state.sheet = "chapters"; render(); } }, [svg('<path d="M5 7h14M5 12h14M5 17h10"/>'), "Chapters"]),
+      h("button", { onclick: () => { state.sheet = "find"; render(); } }, [svg('<circle cx="11" cy="11" r="6"/><path d="M20 20l-3-3"/>'), "Find"]),
       h("button", { onclick: () => { state.view = "immersion"; render(); } }, [svg('<path d="M5 5h14v14H5z"/><path d="M8 9h8M8 12h6"/>'), "Immersion"]),
     ]),
   ]);
@@ -522,11 +601,46 @@ function sheet() {
       }, "End of chapter"),
     ]);
   }
+  if (state.sheet === "find") {
+    return panel("Find in your library", [
+      h("input", {
+        class: "search",
+        placeholder: "Search titles and text",
+        value: state.findQuery,
+        oninput: async (e) => {
+          state.findQuery = e.target.value;
+          if (state.findQuery.length > 1) state.searchHits = await api(`/api/search?q=${encodeURIComponent(state.findQuery)}`);
+          else state.searchHits = { books: [], passages: [] };
+          render();
+        },
+      }),
+      ...(state.searchHits.passages || []).map((hit) => h("button", {
+        class: "hit",
+        onclick: async () => {
+          state.sheet = null;
+          await openBook(hit.book_id);
+          const chapter = state.book.chapters.find((c) => c.id === hit.chapter_id);
+          if (chapter && chapter.status === "ready") {
+            await playChapter(state.book, chapter, 0, true);
+            const cue = (state.cues || []).find((c) => c.charStart >= hit.char_start - 1);
+            if (cue) audio.currentTime = cue.start;
+          }
+        },
+      }, [h("strong", {}, hit.book_title), h("p", {}, hit.snippet)])),
+    ]);
+  }
   if (state.sheet === "more" && state.book) {
     return panel("More", [
       h("button", { class: "row", onclick: () => { state.carMode = true; state.sheet = null; render(); } }, "Car mode"),
       h("button", { class: "row", onclick: () => downloadBook(state.book) }, "Download"),
-      h("button", { class: "row", onclick: () => { state.sheet = null; state.view = "immersion"; render(); } }, "Immersion reading"),
+      h("button", { class: "row", onclick: () => { state.sheet = "find"; render(); } }, "Find in title"),
+      h("button", { class: "row", onclick: () => {
+        if (!state.queue.includes(state.book.id)) state.queue.push(state.book.id);
+        saveQueue();
+        state.sheet = null;
+        toast("Added to Up Next");
+        render();
+      } }, "Add to Up Next"),
       h("div", { class: "muted", style: "margin:10px 0 6px" }, "Jump amount"),
       h("div", { class: "chips" }, [10, 15, 20, 30, 60, 90].map((n) => h("button", {
         class: `chip ${n === state.skip ? "on" : ""}`,
@@ -544,6 +658,16 @@ function homeView() {
     h("div", { class: "kicker" }, "ListenAlong"),
     h("h1", { class: "hello" }, greeting()),
     h("p", { class: "muted" }, "Pick up where you left off, or start something new."),
+    h("input", {
+      class: "search",
+      placeholder: "Search titles and text",
+      onchange: async (e) => {
+        state.findQuery = e.target.value;
+        state.sheet = "find";
+        if (state.findQuery.length > 1) state.searchHits = await api(`/api/search?q=${encodeURIComponent(state.findQuery)}`);
+        render();
+      },
+    }),
     state.installEvent ? h("div", { class: "banner" }, [
       h("div", {}, [h("strong", {}, "Add to Home Screen"), h("div", { class: "muted" }, "Opens like the Audible app.")]),
       h("button", { class: "btn", onclick: async () => { state.installEvent.prompt(); await state.installEvent.userChoice; state.installEvent = null; render(); } }, "Install"),
@@ -576,7 +700,10 @@ function libraryView() {
     return true;
   });
   return h("div", { class: "shell" }, [
-    h("div", { class: "bar" }, [h("h1", { class: "hello" }, "Library"), h("span", { class: "muted" }, `${state.books.length}`)]),
+    h("div", { class: "bar" }, [
+      h("h1", { class: "hello" }, "Library"),
+      h("button", { class: "chip", onclick: () => { state.layout = state.layout === "grid" ? "list" : "grid"; localStorage.setItem("la-layout", state.layout); render(); } }, state.layout === "grid" ? "List" : "Grid"),
+    ]),
     h("input", {
       class: "search",
       placeholder: "Search your titles",
@@ -592,10 +719,16 @@ function libraryView() {
       onclick: () => { state.filter = id; render(); },
     }, label))),
     filtered.length
-      ? h("div", { class: "grid" }, filtered.map((book) => h("button", { class: "tile", style: "flex:none;width:100%", onclick: () => openBook(book.id) }, [
-          coverEl(book),
-          h("div", { class: "meta" }, [h("strong", {}, book.title), h("span", {}, formatLength(book.duration))]),
-        ])))
+      ? (state.layout === "list"
+        ? h("div", {}, filtered.map((book) => h("button", { class: "list-row", onclick: () => openBook(book.id) }, [
+            coverEl(book, "sq"),
+            h("div", {}, [h("strong", {}, book.title), h("div", { class: "muted" }, `${formatLength(book.duration)} · ${book.narrator}`)]),
+            h("span", { class: "muted" }, `${Math.round(book.progress_pct || 0)}%`),
+          ])))
+        : h("div", { class: "grid" }, filtered.map((book) => h("button", { class: "tile", style: "flex:none;width:100%", onclick: () => openBook(book.id) }, [
+            coverEl(book),
+            h("div", { class: "meta" }, [h("strong", {}, book.title), h("span", {}, formatLength(book.duration))]),
+          ]))))
       : h("div", { class: "empty" }, "No titles in this filter."),
   ]);
 }
@@ -621,6 +754,7 @@ function titleView() {
       h("h1", {}, book.title),
       h("p", { class: "muted" }, `By ${book.author || "Unknown"} · Narrated by ${book.narrator}`),
       h("p", { class: "muted" }, `${book.chapter_count} chapters · ${formatLength(book.duration)}`),
+      book.excerpt ? h("p", { class: "excerpt" }, book.excerpt) : null,
     ]),
     h("div", { class: "actions" }, [
       resume && resume.status === "ready" ? h("button", {
@@ -628,6 +762,11 @@ function titleView() {
         onclick: () => playChapter(book, resume, book.progress_chapter === resume.idx ? book.progress_time : 0, true),
       }, book.elapsed > 8 ? "Continue" : "Play") : h("span", { class: "pill" }, "Narrating…"),
       h("button", { class: "btn ghost", onclick: () => downloadBook(book) }, "Download"),
+      h("button", { class: "btn ghost", onclick: () => {
+        if (!state.queue.includes(book.id)) state.queue.push(book.id);
+        saveQueue();
+        toast("Added to Up Next");
+      } }, "Up Next"),
       h("button", { class: "btn ghost", onclick: () => { if (state.chapter) { state.view = "immersion"; render(); } else toast("Play a chapter first"); } }, "Immersion"),
     ]),
     book.status === "processing" ? h("p", { class: "muted" }, `Narrating ${book.ready_chapters}/${book.chapter_count}. You can play chapters as they finish.`) : null,
@@ -719,10 +858,59 @@ function addView() {
       h("label", { class: "field" }, [h("span", {}, "Author"), h("input", { value: state.author, placeholder: "Optional", oninput: (e) => { state.author = e.target.value; } })]),
       h("label", { class: "field" }, [
         h("span", {}, "Narrator"),
-        h("select", { onchange: (e) => { state.voice = e.target.value; } }, state.voices.map((v) => h("option", { value: v.short_name, selected: v.short_name === state.voice }, v.label))),
+        h("select", { onchange: (e) => { state.voice = e.target.value; localStorage.setItem("la-voice", state.voice); } }, state.voices.map((v) => h("option", { value: v.short_name, selected: v.short_name === state.voice }, v.label))),
       ]),
+      h("button", {
+        type: "button",
+        class: "btn ghost",
+        style: "width:100%;margin-bottom:12px",
+        onclick: () => {
+          const preview = new Audio(`/api/voices/${encodeURIComponent(state.voice)}/preview`);
+          preview.play();
+        },
+      }, "Preview narrator"),
       h("button", { class: "btn", type: "submit", style: "width:100%" }, "Start narration"),
     ]),
+  ]);
+}
+
+function youView() {
+  const hours = (n) => `${Math.floor(n / 3600)}h ${Math.round((n % 3600) / 60)}m`;
+  const queued = state.queue.map((id) => state.books.find((b) => b.id === id)).filter(Boolean);
+  return h("div", { class: "shell tight" }, [
+    h("h1", { class: "hello" }, "You"),
+    h("div", { class: "stats" }, [
+      h("div", { class: "stat" }, [h("b", {}, hours(state.stats.today_seconds)), h("span", {}, "Today")]),
+      h("div", { class: "stat" }, [h("b", {}, String(state.stats.streak)), h("span", {}, "Day streak")]),
+      h("div", { class: "stat" }, [h("b", {}, hours(state.stats.total_seconds)), h("span", {}, "All time")]),
+      h("div", { class: "stat" }, [h("b", {}, String(state.stats.finished)), h("span", {}, "Finished titles")]),
+    ]),
+    h("div", { class: "rail-head" }, h("h2", {}, "Playback")),
+    h("div", { class: "row" }, [
+      h("span", {}, `Loudness ${state.boost.toFixed(1)}x`),
+      h("input", { class: "range", type: "range", min: 1, max: 2.5, step: 0.1, value: state.boost, oninput: (e) => {
+        state.boost = Number(e.target.value);
+        localStorage.setItem("la-boost", String(state.boost));
+        ensureGraph();
+        if (gainNode) gainNode.gain.value = state.boost;
+      } }),
+    ]),
+    h("button", { class: "row", onclick: () => { state.keepAwake = !state.keepAwake; localStorage.setItem("la-wake", state.keepAwake ? "1" : "0"); render(); } }, [
+      h("span", {}, "Keep screen awake while playing"),
+      h("span", { class: `switch ${state.keepAwake ? "on" : ""}` }, h("i")),
+    ]),
+    h("button", { class: "row", onclick: () => { state.haptics = !state.haptics; localStorage.setItem("la-haptics", state.haptics ? "1" : "0"); render(); } }, [
+      h("span", {}, "Haptics"),
+      h("span", { class: `switch ${state.haptics ? "on" : ""}` }, h("i")),
+    ]),
+    queued.length ? h("section", {}, [
+      h("div", { class: "rail-head" }, h("h2", {}, "Up Next")),
+      ...queued.map((book) => h("div", { class: "list-row" }, [
+        coverEl(book, "sq"),
+        h("button", { onclick: () => openBook(book.id) }, [h("strong", {}, book.title), h("div", { class: "muted" }, book.narrator)]),
+        h("button", { class: "muted", onclick: () => { state.queue = state.queue.filter((id) => id !== book.id); saveQueue(); render(); } }, "Remove"),
+      ])),
+    ]) : h("p", { class: "muted" }, "Add titles to Up Next from a book page."),
   ]);
 }
 
@@ -804,6 +992,7 @@ function render() {
     library: libraryView,
     title: titleView,
     add: addView,
+    you: youView,
     player: playerView,
     immersion: immersionView,
     login: loginView,
@@ -821,10 +1010,16 @@ function syncPlayButtons() {
 }
 
 audio.addEventListener("timeupdate", () => {
-  if (state.sleepUntil && Date.now() >= state.sleepUntil) {
-    audio.pause();
-    state.sleepUntil = 0;
-    toast("Sleep timer ended");
+  if (state.sleepUntil) {
+    const left = state.sleepUntil - Date.now();
+    if (left <= 0) {
+      audio.pause();
+      state.sleepUntil = 0;
+      if (gainNode) gainNode.gain.value = state.boost;
+      toast("Sleep timer ended");
+    } else if (gainNode && left < 20000) {
+      gainNode.gain.value = state.boost * Math.max(0.05, left / 20000);
+    }
   }
   highlight();
   const seek = document.querySelector(".seek");
@@ -834,8 +1029,8 @@ audio.addEventListener("timeupdate", () => {
   const left = document.querySelector(".left-label");
   if (left && state.chapter) left.textContent = formatLeft(remainingNow(), state.speed);
 });
-audio.addEventListener("pause", () => { saveProgress(); syncPlayButtons(); });
-audio.addEventListener("play", syncPlayButtons);
+audio.addEventListener("pause", () => { saveProgress(); syncPlayButtons(); setWake(false); });
+audio.addEventListener("play", () => { syncPlayButtons(); lastTick = Date.now(); setWake(true); });
 audio.addEventListener("ended", async () => {
   saveProgress();
   if (state.sleepChapter) {
@@ -843,7 +1038,21 @@ audio.addEventListener("ended", async () => {
     toast("Sleep timer ended");
     return;
   }
-  await skipChapter(1);
+  const nextChapter = state.book && state.book.chapters[currentChapterIndex() + 1];
+  if (nextChapter && nextChapter.status === "ready") {
+    await skipChapter(1);
+    return;
+  }
+  const nextId = state.queue.find((id) => id !== (state.book && state.book.id));
+  if (nextId) {
+    state.queue = state.queue.filter((id) => id !== nextId);
+    saveQueue();
+    const book = await api(`/api/books/${nextId}`);
+    const chapter = (book.chapters || []).find((c) => c.status === "ready");
+    if (chapter) await playChapter(book, chapter, 0, true);
+    return;
+  }
+  toast("End of title");
 });
 setInterval(saveProgress, 5000);
 
@@ -865,7 +1074,8 @@ async function boot(alreadyAuthed = false) {
       return;
     }
     state.voices = await api("/api/voices");
-    state.voice = (state.voices[0] && state.voices[0].short_name) || "";
+    state.voice = localStorage.getItem("la-voice") || (state.voices[0] && state.voices[0].short_name) || "";
+    try { state.stats = await api("/api/stats"); } catch { /* ignore */ }
     await refresh(false);
     render();
   } catch {

@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -17,7 +17,8 @@ import auth
 import db
 import extract
 import icons
-from tts import DEFAULT_VOICE, list_english_voices, synthesize_chapter_retry
+import covers
+from tts import DEFAULT_VOICE, list_english_voices, preview_voice, synthesize_chapter_retry
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
@@ -26,8 +27,9 @@ UPLOADS = DATA_DIR / "uploads"
 AUDIO = DATA_DIR / "audio"
 DB_PATH = DATA_DIR / "listenalong.db"
 
-generate_lock = asyncio.Lock()
+generate_lock = asyncio.Semaphore(2)
 voice_cache: list[dict[str, str]] = []
+PREVIEWS = None
 
 WELCOME_TEXT = """
 ListenAlong turns documents into an audiobook you can follow with your eyes and your ears.
@@ -73,39 +75,48 @@ async def seed_welcome() -> None:
     asyncio.create_task(process_book(book_id))
 
 
-async def process_book(book_id: int) -> None:
-    async with generate_lock:
-        book_rows = db.query("SELECT * FROM books WHERE id = ?", (book_id,))
-        if not book_rows:
-            return
-        book = book_rows[0]
-        chapters = db.query(
-            "SELECT * FROM chapters WHERE book_id = ? AND status != 'ready' ORDER BY idx",
-            (book_id,),
+async def _narrate_chapter(book: dict, chapter: dict) -> None:
+    db.execute("UPDATE chapters SET status = ?, error = NULL WHERE id = ?", ("narrating", chapter["id"]))
+    mp3_path = book_audio_dir(book["id"]) / f"{chapter['idx']}.mp3"
+    cues_path = book_audio_dir(book["id"]) / f"{chapter['idx']}.json"
+    try:
+        async with generate_lock:
+            duration, cues = await synthesize_chapter_retry(chapter["text"], book["voice"], mp3_path)
+        cues_path.write_text(json.dumps(cues), encoding="utf-8")
+        db.execute(
+            "UPDATE chapters SET status = ?, duration = ?, error = NULL WHERE id = ?",
+            ("ready", duration, chapter["id"]),
         )
-        db.execute("UPDATE books SET status = ?, error = NULL WHERE id = ?", ("processing", book_id))
-        failures = 0
-        for chapter in chapters:
-            db.execute("UPDATE chapters SET status = ?, error = NULL WHERE id = ?", ("narrating", chapter["id"]))
-            mp3_path = book_audio_dir(book_id) / f"{chapter['idx']}.mp3"
-            cues_path = book_audio_dir(book_id) / f"{chapter['idx']}.json"
-            try:
-                duration, cues = await synthesize_chapter_retry(chapter["text"], book["voice"], mp3_path)
-                cues_path.write_text(json.dumps(cues), encoding="utf-8")
-                db.execute(
-                    "UPDATE chapters SET status = ?, duration = ?, error = NULL WHERE id = ?",
-                    ("ready", duration, chapter["id"]),
-                )
-            except Exception as exc:
-                failures += 1
-                db.execute(
-                    "UPDATE chapters SET status = ?, error = ? WHERE id = ?",
-                    ("error", str(exc), chapter["id"]),
-                )
-        if failures and failures == len(chapters):
-            db.execute("UPDATE books SET status = ?, error = ? WHERE id = ?", ("error", "Narration failed", book_id))
-        else:
-            db.execute("UPDATE books SET status = ?, error = NULL WHERE id = ?", ("ready", book_id))
+    except Exception as exc:
+        db.execute(
+            "UPDATE chapters SET status = ?, error = ? WHERE id = ?",
+            ("error", str(exc), chapter["id"]),
+        )
+
+
+async def process_book(book_id: int) -> None:
+    book_rows = db.query("SELECT * FROM books WHERE id = ?", (book_id,))
+    if not book_rows:
+        return
+    book = book_rows[0]
+    chapters = db.query(
+        "SELECT * FROM chapters WHERE book_id = ? AND status != 'ready' ORDER BY idx",
+        (book_id,),
+    )
+    db.execute("UPDATE books SET status = ?, error = NULL WHERE id = ?", ("processing", book_id))
+    if not chapters:
+        db.execute("UPDATE books SET status = ? WHERE id = ?", ("ready", book_id))
+        return
+    first, *rest = chapters
+    await _narrate_chapter(book, first)
+    if rest:
+        await asyncio.gather(*[_narrate_chapter(book, chapter) for chapter in rest])
+    failed = db.query("SELECT COUNT(*) AS n FROM chapters WHERE book_id = ? AND status = 'error'", (book_id,))[0]["n"]
+    total = db.query("SELECT COUNT(*) AS n FROM chapters WHERE book_id = ?", (book_id,))[0]["n"]
+    if failed and failed == total:
+        db.execute("UPDATE books SET status = ?, error = ? WHERE id = ?", ("error", "Narration failed", book_id))
+    else:
+        db.execute("UPDATE books SET status = ?, error = NULL WHERE id = ?", ("ready", book_id))
 
 
 @asynccontextmanager
@@ -115,6 +126,9 @@ async def lifespan(_app: FastAPI):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     UPLOADS.mkdir(parents=True, exist_ok=True)
     AUDIO.mkdir(parents=True, exist_ok=True)
+    global PREVIEWS
+    PREVIEWS = DATA_DIR / "previews"
+    PREVIEWS.mkdir(parents=True, exist_ok=True)
     icons.ensure_icons(STATIC)
     db.connect(DB_PATH)
     await seed_welcome()
@@ -134,6 +148,7 @@ app.mount("/static", StaticFiles(directory=STATIC), name="static")
 class ProgressIn(BaseModel):
     chapter_idx: int = 0
     time: float = 0
+    listened: float = 0
 
 
 class LoginIn(BaseModel):
@@ -199,6 +214,35 @@ async def logout() -> JSONResponse:
 @app.get("/api/voices")
 async def voices() -> list[dict[str, str]]:
     return voice_cache
+
+
+@app.get("/api/stats")
+async def listening_stats() -> dict:
+    return db.stats()
+
+
+@app.get("/api/search")
+async def search(q: str = "") -> dict:
+    return db.search_library(q)
+
+
+@app.get("/api/books/{book_id}/cover")
+async def book_cover(book_id: int) -> Response:
+    book = db.book_with_chapters(book_id)
+    if not book:
+        raise HTTPException(404, "Book not found")
+    svg = covers.cover_svg(book["id"], book["title"], book.get("author") or "", book.get("narrator") or "", book.get("cover_hue") or 18)
+    return Response(svg, media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.get("/api/voices/{voice}/preview")
+async def voice_preview(voice: str) -> FileResponse:
+    if PREVIEWS is None:
+        raise HTTPException(500, "Not ready")
+    safe = re.sub(r"[^a-zA-Z0-9._-]", "", voice) or "voice"
+    path = PREVIEWS / f"{safe}.mp3"
+    await preview_voice(voice, path)
+    return FileResponse(path, media_type="audio/mpeg")
 
 
 @app.get("/api/home")
@@ -295,6 +339,7 @@ async def save_progress(book_id: int, payload: ProgressIn) -> dict:
         "UPDATE books SET progress_chapter = ?, progress_time = ?, last_listened_at = datetime('now') WHERE id = ?",
         (payload.chapter_idx, payload.time, book_id),
     )
+    db.add_listen_seconds(payload.listened)
     book = db.book_with_chapters(book_id)
     if book and book["duration"] and book["elapsed"] >= book["duration"] * 0.98:
         db.execute("UPDATE books SET finished_at = datetime('now') WHERE id = ? AND finished_at IS NULL", (book_id,))

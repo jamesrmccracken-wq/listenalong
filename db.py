@@ -57,6 +57,14 @@ def connect(db_path: Path) -> None:
     )
     _ensure_column("books", "last_listened_at", "TEXT")
     _ensure_column("books", "finished_at", "TEXT")
+    _conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS listen_days (
+            day TEXT PRIMARY KEY,
+            seconds REAL NOT NULL DEFAULT 0
+        );
+        """
+    )
     _conn.commit()
 
 
@@ -121,6 +129,8 @@ def book_with_chapters(book_id: int) -> dict[str, Any] | None:
         """,
         (book_id,),
     )
+    blurb = query("SELECT substr(text, 1, 420) AS excerpt FROM chapters WHERE book_id = ? ORDER BY idx LIMIT 1", (book_id,))
+    book["excerpt"] = (blurb[0]["excerpt"] if blurb else "") or ""
     return _progress_stats(book, book["chapters"])
 
 
@@ -160,6 +170,67 @@ def home() -> dict[str, Any]:
         "finished": finished[:12],
         "library_count": len(books),
     }
+
+
+def add_listen_seconds(seconds: float) -> None:
+    if seconds <= 0:
+        return
+    execute(
+        """
+        INSERT INTO listen_days (day, seconds) VALUES (date('now'), ?)
+        ON CONFLICT(day) DO UPDATE SET seconds = seconds + excluded.seconds
+        """,
+        (float(seconds),),
+    )
+
+
+def stats() -> dict[str, Any]:
+    today = query("SELECT seconds FROM listen_days WHERE day = date('now')")
+    total = query("SELECT COALESCE(SUM(seconds), 0) AS seconds FROM listen_days")
+    finished = query("SELECT COUNT(*) AS n FROM books WHERE finished_at IS NOT NULL")
+    titles = query("SELECT COUNT(*) AS n FROM books")
+    days = query("SELECT day, seconds FROM listen_days WHERE seconds >= 60 ORDER BY day DESC LIMIT 400")
+    streak = 0
+    expected = query("SELECT date('now') AS d")[0]["d"]
+    for row in days:
+        if row["day"] != expected:
+            # allow missing today
+            if streak == 0 and row["day"] != expected:
+                expected = query("SELECT date('now', '-1 day') AS d")[0]["d"]
+                if row["day"] != expected:
+                    break
+        streak += 1
+        expected = query("SELECT date(?, '-1 day') AS d", (row["day"],))[0]["d"]
+    return {
+        "today_seconds": float(today[0]["seconds"]) if today else 0,
+        "total_seconds": float(total[0]["seconds"] if total else 0),
+        "finished": int(finished[0]["n"] if finished else 0),
+        "titles": int(titles[0]["n"] if titles else 0),
+        "streak": streak,
+    }
+
+
+def search_library(q: str, limit: int = 24) -> dict[str, Any]:
+    needle = q.strip()
+    if len(needle) < 2:
+        return {"books": [], "passages": []}
+    like = f"%{needle}%"
+    books = list_books(needle)
+    passages = query(
+        """
+        SELECT chapters.id AS chapter_id, chapters.idx, chapters.title AS chapter_title,
+               chapters.book_id, books.title AS book_title,
+               substr(chapters.text, max(instr(lower(chapters.text), lower(?)) - 60, 1), 180) AS snippet,
+               instr(lower(chapters.text), lower(?)) AS char_start
+        FROM chapters
+        JOIN books ON books.id = chapters.book_id
+        WHERE chapters.text LIKE ?
+        ORDER BY books.last_listened_at DESC
+        LIMIT ?
+        """,
+        (needle, needle, like, limit),
+    )
+    return {"books": books[:12], "passages": [p for p in passages if p["char_start"]]}
 
 
 def continue_book() -> dict[str, Any] | None:
