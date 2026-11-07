@@ -23,6 +23,34 @@ class ListenAlongAuthTests(unittest.TestCase):
             self.assertFalse(auth.valid_token(token[:-1] + ("0" if token[-1] != "0" else "1")))
             self.assertFalse(auth.valid_token(auth.sign("admin")))
 
+    def test_signed_session_expires_on_server(self):
+        with patch.dict(os.environ, {"APP_SECRET": "test-only-secret"}, clear=True):
+            with patch("auth.time.time", return_value=1000000000):
+                token = auth.sign("ok")
+                self.assertTrue(auth.valid_token(token))
+            with patch("auth.time.time", return_value=1000000000 + auth.MAX_AGE):
+                self.assertTrue(auth.valid_token(token))
+            with patch("auth.time.time", return_value=1000000000 + auth.MAX_AGE + 1):
+                self.assertFalse(auth.valid_token(token))
+
+    def test_future_and_malformed_sessions_are_rejected(self):
+        with patch.dict(os.environ, {"APP_SECRET": "test-only-secret"}, clear=True):
+            with patch("auth.time.time", return_value=1000000000):
+                token = auth.sign("ok")
+                self.assertTrue(auth.valid_token(token))
+            with patch("auth.time.time", return_value=1000000000 - 61):
+                self.assertFalse(auth.valid_token(token))
+            self.assertFalse(auth.valid_token(auth.sign("v1:not-a-number")))
+            self.assertFalse(auth.valid_token(auth.sign("v1:9999999999999")))
+
+    def test_legacy_static_session_is_not_accepted(self):
+        with patch.dict(os.environ, {"APP_SECRET": "test-only-secret"}, clear=True):
+            self.assertFalse(auth.valid_token(auth.sign("admin")))
+            legacy = "ok." + __import__("hmac").new(
+                auth.secret(), b"ok", __import__("hashlib").sha256
+            ).hexdigest()
+            self.assertFalse(auth.valid_token(legacy))
+
     def test_private_api_not_public(self):
         self.assertTrue(auth.is_public("/api/login"))
         self.assertFalse(auth.is_public("/api/books"))
