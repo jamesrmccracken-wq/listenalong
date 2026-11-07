@@ -29,5 +29,15 @@ class ZipResourceLimitsTests(unittest.TestCase):
                     extract.extract_zip(archive, "Large")
 
 
+    def test_rejects_aggregate_text_across_multiple_files(self):
+        with TemporaryDirectory() as directory:
+            archive = Path(directory) / "aggregate.zip"
+            with zipfile.ZipFile(archive, "w") as zf:
+                zf.writestr("first.txt", "abcdefghij")
+                zf.writestr("second.txt", "klmnopqrst")
+            with patch.object(extract, "MAX_BOOK_CHARS", 15):
+                with self.assertRaisesRegex(ValueError, "too large to narrate"):
+                    extract.extract_zip(archive, "Aggregate")
+
 if __name__ == "__main__":
     unittest.main()
