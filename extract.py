@@ -221,6 +221,8 @@ def extract_zip(path: Path, fallback_title: str) -> list[ExtractedChapter]:
                 for i, ch in enumerate(nested, start=1):
                     ch.title = f"{title_from_name(name)} · {ch.title if ch.title else i}"
             chapters.extend(nested)
+            if sum(len(ch.text) for ch in chapters) > MAX_BOOK_CHARS:
+                raise ValueError("That folder or document is too large to narrate in one go")
     return chapters or [ExtractedChapter(title=fallback_title, text="")]
 
 
