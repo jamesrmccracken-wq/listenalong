@@ -28,3 +28,7 @@ Open the hosted URL, sign in, then **Add to Home Screen**. Use **Save offline** 
 ## Import
 
 PDF, EPUB, Word, markdown, text, code, zip, or a folder. On iPhone, zip the folder first.
+
+## Hosted authentication requirements
+
+When deployed with `RENDER` set, configure both `APP_PASSWORD` and a unique, cryptographically random `APP_SECRET` through the hosting provider's secret environment settings. Without `APP_SECRET`, session signing fails closed and existing cookies are rejected. Never commit either value. Local passwordless mode is intended only for a trusted local development environment; do not expose it to the internet. Rotate the signing secret to invalidate all existing sessions if it is disclosed.
