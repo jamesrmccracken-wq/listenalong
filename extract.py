@@ -77,6 +77,8 @@ SUPPORTED = TEXT_EXTENSIONS | DOC_EXTENSIONS | {".zip"}
 MAX_CHAPTER_CHARS = 4500
 MAX_FILE_BYTES = 40 * 1024 * 1024
 MAX_BOOK_CHARS = 2_000_000
+MAX_ZIP_ENTRIES = 250
+MAX_ZIP_UNCOMPRESSED_BYTES = 80 * 1024 * 1024
 
 
 @dataclass
@@ -201,6 +203,10 @@ def extract_zip(path: Path, fallback_title: str) -> list[ExtractedChapter]:
         )
         if not names:
             raise ValueError("No readable documents were found in that folder")
+        if len(names) > MAX_ZIP_ENTRIES:
+            raise ValueError("Archive contains too many documents")
+        if sum(zf.getinfo(name).file_size for name in names) > MAX_ZIP_UNCOMPRESSED_BYTES:
+            raise ValueError("Archive contains too much uncompressed data")
         nested_dir = path.parent / "_unzip"
         nested_dir.mkdir(parents=True, exist_ok=True)
         for name in names:
