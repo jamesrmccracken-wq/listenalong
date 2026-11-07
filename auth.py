@@ -35,12 +35,17 @@ def required() -> bool:
     return bool(password())
 
 
+def session_key() -> bytes:
+    # Bind sessions to the configured password without storing or exposing it.
+    # Rotating APP_PASSWORD or APP_SECRET invalidates all existing sessions.
+    return hmac.new(secret(), b"listenalong-session-v2\\x00" + password().encode("utf-8"), hashlib.sha256).digest()
+
+
 def sign(value: str) -> str:
-    # Session tokens are time-bound. Previously issued static "ok" cookies
-    # intentionally stop working after this upgrade; users must sign in again.
+    # Version 2 sessions are time-bound and invalidated by password rotation.
     if value == "ok":
-        value = f"v1:{int(time.time())}"
-    digest = hmac.new(secret(), value.encode("utf-8"), hashlib.sha256).hexdigest()
+        value = f"v2:{int(time.time())}"
+    digest = hmac.new(session_key(), value.encode("utf-8"), hashlib.sha256).hexdigest()
     return f"{value}.{digest}"
 
 
@@ -48,7 +53,7 @@ def valid_token(token: str | None) -> bool:
     if not token or "." not in token:
         return False
     value, _, digest = token.rpartition(".")
-    if not value.startswith("v1:"):
+    if not value.startswith("v2:"):
         return False
     timestamp = value[3:]
     if not timestamp.isascii() or not timestamp.isdecimal() or len(timestamp) > 12:
@@ -58,7 +63,7 @@ def valid_token(token: str | None) -> bool:
     # Bound server-side validity independently of the browser cookie's expiry.
     if issued_at > now + 60 or now - issued_at > MAX_AGE:
         return False
-    expected = hmac.new(secret(), value.encode("utf-8"), hashlib.sha256).hexdigest()
+    expected = hmac.new(session_key(), value.encode("utf-8"), hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, digest)
 
 
