@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import hashlib
 import hmac
 import os
@@ -12,7 +14,8 @@ from starlette.responses import JSONResponse, Response
 
 COOKIE = "la_auth"
 MAX_AGE = 60 * 60 * 24 * 90
-_login_hits: dict[str, list[float]] = {}
+MAX_TRACKED_IPS = 4096
+_login_hits: OrderedDict[str, list[float]] = OrderedDict()
 
 
 def password() -> str:
@@ -68,8 +71,17 @@ def check_password(candidate: str) -> bool:
 
 def rate_limited(ip: str) -> bool:
     now = time.time()
+    if ip not in _login_hits and len(_login_hits) >= MAX_TRACKED_IPS:
+        # Bound process memory under many unique source IPs. This is not a
+        # substitute for shared reverse-proxy throttling in multi-worker hosts.
+        for key, hits in list(_login_hits.items()):
+            if not hits or now - hits[-1] >= 60:
+                del _login_hits[key]
+        if len(_login_hits) >= MAX_TRACKED_IPS:
+            _login_hits.popitem(last=False)
     window = [t for t in _login_hits.get(ip, []) if now - t < 60]
     _login_hits[ip] = window
+    _login_hits.move_to_end(ip)
     if len(window) >= 12:
         return True
     window.append(now)
