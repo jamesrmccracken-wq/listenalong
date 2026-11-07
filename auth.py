@@ -20,8 +20,10 @@ def password() -> str:
 
 
 def secret() -> bytes:
-    raw = os.environ.get("APP_SECRET", "").strip() or "listenalong-dev-secret"
-    return raw.encode("utf-8")
+    raw = os.environ.get("APP_SECRET", "").strip()
+    if os.environ.get("RENDER") and len(raw) < 32:
+        raise RuntimeError("Hosted ListenAlong requires APP_SECRET of at least 32 characters")
+    return (raw or "listenalong-dev-secret").encode("utf-8")
 
 
 def required() -> bool:
