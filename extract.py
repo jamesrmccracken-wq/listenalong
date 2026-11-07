@@ -274,6 +274,7 @@ def extract_docx(path: Path, title: str) -> list[ExtractedChapter]:
 
 def extract_epub(path: Path, fallback_title: str) -> list[ExtractedChapter]:
     chapters: list[ExtractedChapter] = []
+    total_chars = 0
     with zipfile.ZipFile(path) as zf:
         validate_archive(zf)
         names = zf.namelist()
@@ -308,6 +309,9 @@ def extract_epub(path: Path, fallback_title: str) -> list[ExtractedChapter]:
             text = _html_to_text(html)
             if len(text) < 40:
                 continue
+            total_chars += len(text)
+            if total_chars > MAX_BOOK_CHARS:
+                raise ValueError("That folder or document is too large to narrate in one go")
             heading = _first_heading(html) or title_from_name(match)
             chapters.extend(split_into_chapters(heading, text))
     if not chapters:
