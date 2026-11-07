@@ -28,5 +28,17 @@ class ListenAlongAuthTests(unittest.TestCase):
         self.assertFalse(auth.is_public("/api/books"))
         self.assertFalse(auth.is_public("/api/download"))
 
+    def test_hosted_signing_secret_must_be_configured(self):
+        with patch.dict(os.environ, {"RENDER": "true", "APP_SECRET": ""}):
+            with self.assertRaises(RuntimeError):
+                auth.secret()
+        with patch.dict(os.environ, {"RENDER": "true", "APP_SECRET": "short"}):
+            with self.assertRaises(RuntimeError):
+                auth.secret()
+
+    def test_hosted_strong_secret_allows_signatures(self):
+        with patch.dict(os.environ, {"RENDER": "true", "APP_SECRET": "x" * 48}):
+            self.assertTrue(auth.valid_token(auth.sign("ok")))
+
 if __name__ == "__main__":
     unittest.main()
