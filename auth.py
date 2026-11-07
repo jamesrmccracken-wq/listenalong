@@ -33,6 +33,10 @@ def required() -> bool:
 
 
 def sign(value: str) -> str:
+    # Session tokens are time-bound. Previously issued static "ok" cookies
+    # intentionally stop working after this upgrade; users must sign in again.
+    if value == "ok":
+        value = f"v1:{int(time.time())}"
     digest = hmac.new(secret(), value.encode("utf-8"), hashlib.sha256).hexdigest()
     return f"{value}.{digest}"
 
@@ -41,8 +45,18 @@ def valid_token(token: str | None) -> bool:
     if not token or "." not in token:
         return False
     value, _, digest = token.rpartition(".")
+    if not value.startswith("v1:"):
+        return False
+    timestamp = value[3:]
+    if not timestamp.isascii() or not timestamp.isdecimal() or len(timestamp) > 12:
+        return False
+    issued_at = int(timestamp)
+    now = int(time.time())
+    # Bound server-side validity independently of the browser cookie's expiry.
+    if issued_at > now + 60 or now - issued_at > MAX_AGE:
+        return False
     expected = hmac.new(secret(), value.encode("utf-8"), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, digest) and value == "ok"
+    return hmac.compare_digest(expected, digest)
 
 
 def check_password(candidate: str) -> bool:
