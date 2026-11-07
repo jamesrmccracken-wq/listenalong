@@ -52,6 +52,24 @@ class ListenAlongAuthTests(unittest.TestCase):
             ).hexdigest()
             self.assertFalse(auth.valid_token(legacy))
 
+    def test_password_rotation_revokes_existing_session(self):
+        with patch.dict(os.environ, {"APP_SECRET": "test-only-secret", "APP_PASSWORD": "before"}, clear=True):
+            token = auth.sign("ok")
+            self.assertTrue(auth.valid_token(token))
+            os.environ["APP_PASSWORD"] = "after"
+            self.assertFalse(auth.valid_token(token))
+            self.assertTrue(auth.valid_token(auth.sign("ok")))
+
+    def test_secret_rotation_revokes_existing_session(self):
+        with patch.dict(os.environ, {"APP_SECRET": "test-only-secret", "APP_PASSWORD": "same"}, clear=True):
+            token = auth.sign("ok")
+            os.environ["APP_SECRET"] = "replacement-secret"
+            self.assertFalse(auth.valid_token(token))
+
+    def test_previous_session_version_is_rejected(self):
+        with patch.dict(os.environ, {"APP_SECRET": "test-only-secret"}, clear=True):
+            self.assertFalse(auth.valid_token(auth.sign("v1:1000000000")))
+
     def test_login_throttle_limits_attempts_per_ip(self):
         with patch.object(auth, "_login_hits", OrderedDict()):
             with patch("auth.time.time", return_value=1000):
