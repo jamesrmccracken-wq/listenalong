@@ -20,8 +20,10 @@ def password() -> str:
 
 
 def secret() -> bytes:
-    raw = os.environ.get("APP_SECRET", "").strip() or "listenalong-dev-secret"
-    return raw.encode("utf-8")
+    raw = os.environ.get("APP_SECRET", "").strip()
+    if not raw and os.environ.get("RENDER"):
+        raise RuntimeError("APP_SECRET must be configured for hosted deployments")
+    return (raw or "listenalong-dev-secret").encode("utf-8")
 
 
 def required() -> bool:
@@ -37,6 +39,8 @@ def sign(value: str) -> str:
 
 def valid_token(token: str | None) -> bool:
     if not token or "." not in token:
+        return False
+    if os.environ.get("RENDER") and not os.environ.get("APP_SECRET", "").strip():
         return False
     value, _, digest = token.rpartition(".")
     expected = hmac.new(secret(), value.encode("utf-8"), hashlib.sha256).hexdigest()
