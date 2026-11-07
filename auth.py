@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import hashlib
 import hmac
 import os
@@ -12,7 +14,8 @@ from starlette.responses import JSONResponse, Response
 
 COOKIE = "la_auth"
 MAX_AGE = 60 * 60 * 24 * 90
-_login_hits: dict[str, list[float]] = {}
+MAX_TRACKED_IPS = 4096
+_login_hits: OrderedDict[str, list[float]] = OrderedDict()
 
 
 def password() -> str:
@@ -20,8 +23,10 @@ def password() -> str:
 
 
 def secret() -> bytes:
-    raw = os.environ.get("APP_SECRET", "").strip() or "listenalong-dev-secret"
-    return raw.encode("utf-8")
+    raw = os.environ.get("APP_SECRET", "").strip()
+    if os.environ.get("RENDER") and len(raw) < 32:
+        raise RuntimeError("Hosted ListenAlong requires APP_SECRET of at least 32 characters")
+    return (raw or "listenalong-dev-secret").encode("utf-8")
 
 
 def required() -> bool:
@@ -30,8 +35,17 @@ def required() -> bool:
     return bool(password())
 
 
+def session_key() -> bytes:
+    # Bind sessions to the configured password without storing or exposing it.
+    # Rotating APP_PASSWORD or APP_SECRET invalidates all existing sessions.
+    return hmac.new(secret(), b"listenalong-session-v2\\x00" + password().encode("utf-8"), hashlib.sha256).digest()
+
+
 def sign(value: str) -> str:
-    digest = hmac.new(secret(), value.encode("utf-8"), hashlib.sha256).hexdigest()
+    # Version 2 sessions are time-bound and invalidated by password rotation.
+    if value == "ok":
+        value = f"v2:{int(time.time())}"
+    digest = hmac.new(session_key(), value.encode("utf-8"), hashlib.sha256).hexdigest()
     return f"{value}.{digest}"
 
 
@@ -39,8 +53,18 @@ def valid_token(token: str | None) -> bool:
     if not token or "." not in token:
         return False
     value, _, digest = token.rpartition(".")
-    expected = hmac.new(secret(), value.encode("utf-8"), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, digest) and value == "ok"
+    if not value.startswith("v2:"):
+        return False
+    timestamp = value[3:]
+    if not timestamp.isascii() or not timestamp.isdecimal() or len(timestamp) > 12:
+        return False
+    issued_at = int(timestamp)
+    now = int(time.time())
+    # Bound server-side validity independently of the browser cookie's expiry.
+    if issued_at > now + 60 or now - issued_at > MAX_AGE:
+        return False
+    expected = hmac.new(session_key(), value.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, digest)
 
 
 def check_password(candidate: str) -> bool:
@@ -52,8 +76,17 @@ def check_password(candidate: str) -> bool:
 
 def rate_limited(ip: str) -> bool:
     now = time.time()
+    if ip not in _login_hits and len(_login_hits) >= MAX_TRACKED_IPS:
+        # Bound process memory under many unique source IPs. This is not a
+        # substitute for shared reverse-proxy throttling in multi-worker hosts.
+        for key, hits in list(_login_hits.items()):
+            if not hits or now - hits[-1] >= 60:
+                del _login_hits[key]
+        if len(_login_hits) >= MAX_TRACKED_IPS:
+            _login_hits.popitem(last=False)
     window = [t for t in _login_hits.get(ip, []) if now - t < 60]
     _login_hits[ip] = window
+    _login_hits.move_to_end(ip)
     if len(window) >= 12:
         return True
     window.append(now)

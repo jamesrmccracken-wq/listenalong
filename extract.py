@@ -77,6 +77,9 @@ SUPPORTED = TEXT_EXTENSIONS | DOC_EXTENSIONS | {".zip"}
 MAX_CHAPTER_CHARS = 4500
 MAX_FILE_BYTES = 40 * 1024 * 1024
 MAX_BOOK_CHARS = 2_000_000
+MAX_PDF_PAGES = 500
+MAX_ZIP_ENTRIES = 250
+MAX_ZIP_UNCOMPRESSED_BYTES = 80 * 1024 * 1024
 
 
 @dataclass
@@ -188,9 +191,21 @@ def extract_bytes(filename: str, data: bytes, work_dir: Path) -> list[ExtractedC
     return chapters
 
 
+def validate_archive(zf: zipfile.ZipFile) -> None:
+    """Validate container resources before any member or document parser reads."""
+    entries = zf.infolist()
+    if len(entries) > MAX_ZIP_ENTRIES:
+        raise ValueError("Archive contains too many documents")
+    if sum(info.file_size for info in entries) > MAX_ZIP_UNCOMPRESSED_BYTES:
+        raise ValueError("Archive contains too much uncompressed data")
+    if any(info.file_size > MAX_FILE_BYTES for info in entries):
+        raise ValueError("Archive contains an oversized member")
+
+
 def extract_zip(path: Path, fallback_title: str) -> list[ExtractedChapter]:
     chapters: list[ExtractedChapter] = []
     with zipfile.ZipFile(path) as zf:
+        validate_archive(zf)
         names = sorted(
             n
             for n in zf.namelist()
@@ -201,6 +216,10 @@ def extract_zip(path: Path, fallback_title: str) -> list[ExtractedChapter]:
         )
         if not names:
             raise ValueError("No readable documents were found in that folder")
+        if len(names) > MAX_ZIP_ENTRIES:
+            raise ValueError("Archive contains too many documents")
+        if sum(zf.getinfo(name).file_size for name in names) > MAX_ZIP_UNCOMPRESSED_BYTES:
+            raise ValueError("Archive contains too much uncompressed data")
         nested_dir = path.parent / "_unzip"
         nested_dir.mkdir(parents=True, exist_ok=True)
         for name in names:
@@ -215,21 +234,36 @@ def extract_zip(path: Path, fallback_title: str) -> list[ExtractedChapter]:
                 for i, ch in enumerate(nested, start=1):
                     ch.title = f"{title_from_name(name)} · {ch.title if ch.title else i}"
             chapters.extend(nested)
+            if sum(len(ch.text) for ch in chapters) > MAX_BOOK_CHARS:
+                raise ValueError("That folder or document is too large to narrate in one go")
     return chapters or [ExtractedChapter(title=fallback_title, text="")]
 
 
 def extract_pdf(path: Path, title: str) -> list[ExtractedChapter]:
     reader = PdfReader(str(path))
+    # The upload byte limit does not bound PDF page count or text expansion.
+    # Reject excessive page counts before asking the parser to extract text.
+    if len(reader.pages) > MAX_PDF_PAGES:
+        raise ValueError("PDF contains too many pages")
     pages: list[str] = []
+    total_chars = 0
     for page in reader.pages:
-        pages.append(clean_text(page.extract_text() or ""))
-    text = clean_text("\n\n".join(p for p in pages if p))
+        content = clean_text(page.extract_text() or "")
+        if not content:
+            continue
+        total_chars += len(content) + (2 if pages else 0)
+        if total_chars > MAX_BOOK_CHARS:
+            raise ValueError("PDF contains too much text")
+        pages.append(content)
+    text = clean_text("\n\n".join(pages))
     if not text:
         raise ValueError("No text could be extracted from that PDF (it may be scanned images)")
     return split_into_chapters(title, text)
 
 
 def extract_docx(path: Path, title: str) -> list[ExtractedChapter]:
+    with zipfile.ZipFile(path) as zf:
+        validate_archive(zf)
     with path.open("rb") as fh:
         result = mammoth.convert_to_html(fh)
     text = _html_to_text(result.value)
@@ -240,7 +274,9 @@ def extract_docx(path: Path, title: str) -> list[ExtractedChapter]:
 
 def extract_epub(path: Path, fallback_title: str) -> list[ExtractedChapter]:
     chapters: list[ExtractedChapter] = []
+    total_chars = 0
     with zipfile.ZipFile(path) as zf:
+        validate_archive(zf)
         names = zf.namelist()
         opf_name = next((n for n in names if n.endswith(".opf")), None)
         spine_hrefs: list[str] = []
@@ -273,6 +309,9 @@ def extract_epub(path: Path, fallback_title: str) -> list[ExtractedChapter]:
             text = _html_to_text(html)
             if len(text) < 40:
                 continue
+            total_chars += len(text)
+            if total_chars > MAX_BOOK_CHARS:
+                raise ValueError("That folder or document is too large to narrate in one go")
             heading = _first_heading(html) or title_from_name(match)
             chapters.extend(split_into_chapters(heading, text))
     if not chapters:
@@ -311,3 +350,4 @@ def _soften_markdown(text: str) -> str:
     text = re.sub(r"^#{1,6}\s*", "", text, flags=re.M)
     text = re.sub(r"[*_~]{1,3}", "", text)
     return text
+
