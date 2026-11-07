@@ -190,9 +190,21 @@ def extract_bytes(filename: str, data: bytes, work_dir: Path) -> list[ExtractedC
     return chapters
 
 
+def validate_archive(zf: zipfile.ZipFile) -> None:
+    """Validate container resources before any member or document parser reads."""
+    entries = zf.infolist()
+    if len(entries) > MAX_ZIP_ENTRIES:
+        raise ValueError("Archive contains too many documents")
+    if sum(info.file_size for info in entries) > MAX_ZIP_UNCOMPRESSED_BYTES:
+        raise ValueError("Archive contains too much uncompressed data")
+    if any(info.file_size > MAX_FILE_BYTES for info in entries):
+        raise ValueError("Archive contains an oversized member")
+
+
 def extract_zip(path: Path, fallback_title: str) -> list[ExtractedChapter]:
     chapters: list[ExtractedChapter] = []
     with zipfile.ZipFile(path) as zf:
+        validate_archive(zf)
         names = sorted(
             n
             for n in zf.namelist()
@@ -238,6 +250,8 @@ def extract_pdf(path: Path, title: str) -> list[ExtractedChapter]:
 
 
 def extract_docx(path: Path, title: str) -> list[ExtractedChapter]:
+    with zipfile.ZipFile(path) as zf:
+        validate_archive(zf)
     with path.open("rb") as fh:
         result = mammoth.convert_to_html(fh)
     text = _html_to_text(result.value)
@@ -249,6 +263,7 @@ def extract_docx(path: Path, title: str) -> list[ExtractedChapter]:
 def extract_epub(path: Path, fallback_title: str) -> list[ExtractedChapter]:
     chapters: list[ExtractedChapter] = []
     with zipfile.ZipFile(path) as zf:
+        validate_archive(zf)
         names = zf.namelist()
         opf_name = next((n for n in names if n.endswith(".opf")), None)
         spine_hrefs: list[str] = []
@@ -319,3 +334,4 @@ def _soften_markdown(text: str) -> str:
     text = re.sub(r"^#{1,6}\s*", "", text, flags=re.M)
     text = re.sub(r"[*_~]{1,3}", "", text)
     return text
+

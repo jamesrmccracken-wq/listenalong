@@ -24,6 +24,8 @@ ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
 DATA_DIR = Path(os.environ.get("DATA_DIR", ROOT / "data")).resolve()
 UPLOADS = DATA_DIR / "uploads"
+MAX_IMPORT_FILES = 250
+MAX_IMPORT_BYTES = 80 * 1024 * 1024
 AUDIO = DATA_DIR / "audio"
 DB_PATH = DATA_DIR / "listenalong.db"
 
@@ -399,6 +401,17 @@ async def delete_book(book_id: int) -> dict:
     return {"ok": True}
 
 
+async def read_upload_bounded(upload: UploadFile, remaining_bytes: int) -> bytes:
+    """Bound memory reads before document parsing, including folder aggregates."""
+    limit = min(extract.MAX_FILE_BYTES, remaining_bytes)
+    if limit < 0:
+        raise HTTPException(413, "Import byte limit exceeded")
+    data = await upload.read(limit + 1)
+    if len(data) > limit:
+        raise HTTPException(413, "Document or import byte limit exceeded")
+    return data
+
+
 @app.post("/api/books")
 async def create_book(
     files: list[UploadFile] = File(...),
@@ -408,6 +421,10 @@ async def create_book(
 ) -> dict:
     if not files:
         raise HTTPException(400, "Choose a document, zip, or folder")
+    if len(files) > MAX_IMPORT_FILES:
+        raise HTTPException(413, "Import contains too many files")
+    total_bytes = 0
+    total_chars = 0
     work = UPLOADS / f"in_{os.getpid()}_{id(files)}"
     work.mkdir(parents=True, exist_ok=True)
     chapters: list[extract.ExtractedChapter] = []
@@ -418,7 +435,8 @@ async def create_book(
             upload = files[0]
             filename = Path(upload.filename or "document").name
             source_names.append(filename)
-            data = await upload.read()
+            data = await read_upload_bounded(upload, MAX_IMPORT_BYTES - total_bytes)
+            total_bytes += len(data)
             chapters = extract.extract_bytes(filename, data, work)
             inferred = extract.title_from_name(filename)
         else:
@@ -427,8 +445,12 @@ async def create_book(
                 if not extract.is_supported(filename):
                     continue
                 source_names.append(filename)
-                data = await upload.read()
+                data = await read_upload_bounded(upload, MAX_IMPORT_BYTES - total_bytes)
+                total_bytes += len(data)
                 extracted = extract.extract_bytes(filename, data, work)
+                total_chars += sum(len(ch.text) for ch in extracted)
+                if total_chars > extract.MAX_BOOK_CHARS:
+                    raise HTTPException(413, "Import contains too much extracted text")
                 if len(extracted) == 1:
                     extracted[0].title = extract.title_from_name(filename)
                 chapters.extend(extracted)
@@ -458,3 +480,4 @@ async def create_book(
     book = db.book_with_chapters(book_id)
     assert book
     return book
+
