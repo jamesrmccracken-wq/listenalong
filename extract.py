@@ -77,6 +77,7 @@ SUPPORTED = TEXT_EXTENSIONS | DOC_EXTENSIONS | {".zip"}
 MAX_CHAPTER_CHARS = 4500
 MAX_FILE_BYTES = 40 * 1024 * 1024
 MAX_BOOK_CHARS = 2_000_000
+MAX_PDF_PAGES = 500
 MAX_ZIP_ENTRIES = 250
 MAX_ZIP_UNCOMPRESSED_BYTES = 80 * 1024 * 1024
 
@@ -240,10 +241,21 @@ def extract_zip(path: Path, fallback_title: str) -> list[ExtractedChapter]:
 
 def extract_pdf(path: Path, title: str) -> list[ExtractedChapter]:
     reader = PdfReader(str(path))
+    # The upload byte limit does not bound PDF page count or text expansion.
+    # Reject excessive page counts before asking the parser to extract text.
+    if len(reader.pages) > MAX_PDF_PAGES:
+        raise ValueError("PDF contains too many pages")
     pages: list[str] = []
+    total_chars = 0
     for page in reader.pages:
-        pages.append(clean_text(page.extract_text() or ""))
-    text = clean_text("\n\n".join(p for p in pages if p))
+        content = clean_text(page.extract_text() or "")
+        if not content:
+            continue
+        total_chars += len(content) + (2 if pages else 0)
+        if total_chars > MAX_BOOK_CHARS:
+            raise ValueError("PDF contains too much text")
+        pages.append(content)
+    text = clean_text("\n\n".join(pages))
     if not text:
         raise ValueError("No text could be extracted from that PDF (it may be scanned images)")
     return split_into_chapters(title, text)
