@@ -1,5 +1,6 @@
 """Offline authentication contract tests for ListenAlong."""
 import os
+from collections import OrderedDict
 import unittest
 from unittest.mock import patch
 
@@ -50,6 +51,27 @@ class ListenAlongAuthTests(unittest.TestCase):
                 auth.secret(), b"ok", __import__("hashlib").sha256
             ).hexdigest()
             self.assertFalse(auth.valid_token(legacy))
+
+    def test_login_throttle_limits_attempts_per_ip(self):
+        with patch.object(auth, "_login_hits", OrderedDict()):
+            with patch("auth.time.time", return_value=1000):
+                for _ in range(12):
+                    self.assertFalse(auth.rate_limited("192.0.2.10"))
+                self.assertTrue(auth.rate_limited("192.0.2.10"))
+                self.assertFalse(auth.rate_limited("192.0.2.11"))
+
+    def test_login_throttle_memory_is_bounded(self):
+        with patch.object(auth, "_login_hits", OrderedDict()):
+            with patch.object(auth, "MAX_TRACKED_IPS", 2):
+                with patch("auth.time.time", return_value=1000):
+                    auth.rate_limited("192.0.2.10")
+                    auth.rate_limited("192.0.2.11")
+                    auth.rate_limited("192.0.2.12")
+                    self.assertEqual(len(auth._login_hits), 2)
+                    self.assertNotIn("192.0.2.10", auth._login_hits)
+                with patch("auth.time.time", return_value=1061):
+                    auth.rate_limited("192.0.2.13")
+                    self.assertEqual(list(auth._login_hits), ["192.0.2.13"])
 
     def test_private_api_not_public(self):
         self.assertTrue(auth.is_public("/api/login"))
