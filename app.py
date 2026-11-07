@@ -123,8 +123,11 @@ async def process_book(book_id: int) -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    if os.environ.get("RENDER") and not auth.password():
-        raise RuntimeError("APP_PASSWORD must be set in production")
+    if os.environ.get("RENDER"):
+        if not auth.password():
+            raise RuntimeError("APP_PASSWORD must be set in production")
+        # Fail startup rather than accepting traffic with a missing signing key.
+        auth.secret()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     UPLOADS.mkdir(parents=True, exist_ok=True)
     AUDIO.mkdir(parents=True, exist_ok=True)
